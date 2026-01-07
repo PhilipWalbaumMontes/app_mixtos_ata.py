@@ -1,0 +1,673 @@
+import csv
+import unicodedata
+from io import StringIO
+
+import pandas as pd
+import streamlit as st
+
+# =======================
+# Índices 0-based por letra:
+# A=0 B=1 C=2 ...
+# =======================
+IDX_A_SHIPMENT_ID = 0
+IDX_B_SHIPMENT_TYPE = 1
+IDX_C_BOL = 2
+
+IDX_G_ESTIMATED = 6
+IDX_H_ACTUAL = 7
+
+IDX_J_DIFF_HOURS = 9          # J = DIFERENCIA (horas)
+IDX_K_MIN = 10                # K = Min (fecha)
+IDX_L_MAX = 11                # L = Max (fecha)
+IDX_N_PRIORITIZED = 13        # N = Valor priorizado (fecha)
+IDX_O_RANGE = 14              # O = RANGO DIFERENCIA
+
+MIN_COLS_A_TO_O = 15  # A..O
+
+
+def sniff_delimiter(text: str) -> str:
+    try:
+        dialect = csv.Sniffer().sniff(text[:65536], delimiters=[",", ";", "\t", "|"])
+        return dialect.delimiter
+    except Exception:
+        return ","
+
+
+def is_blank(x) -> bool:
+    """Blanco si es None/NaN o whitespace-only (incluye ' ')."""
+    if x is None:
+        return True
+    try:
+        if pd.isna(x):
+            return True
+    except Exception:
+        pass
+    return str(x).strip() == ""
+
+
+def normalize_type(x) -> str:
+    """Normaliza Shipment type para comparación robusta."""
+    if is_blank(x):
+        return ""
+    return str(x).strip().upper().replace(" ", "_")
+
+
+def normalize_text_for_compare(x) -> str:
+    """
+    Normaliza texto para comparar (ej: 'No Valido' vs 'no válido'):
+    - strip
+    - lower
+    - colapsa espacios
+    - elimina tildes/acentos
+    """
+    if is_blank(x):
+        return ""
+    s = str(x).strip().lower()
+    s = " ".join(s.split())
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+
+
+def clean_bol_key(x) -> str:
+    """Clave limpia para agrupar BOL (col C)."""
+    if is_blank(x):
+        return ""
+    s = str(x).strip()
+    if s.lower() == "nan":
+        return ""
+    return s
+
+
+# =======================
+# NUEVO: limpieza centralizada para tokens inválidos
+# =======================
+INVALID_DATE_TOKENS = {
+    "no valido", "no válido", "invalido", "inválido",
+    "n/a", "na", "null", "none", "-", "--"
+}
+
+def is_invalid_token(v) -> bool:
+    if is_blank(v):
+        return True
+    nv = normalize_text_for_compare(v)
+    if nv in INVALID_DATE_TOKENS:
+        return True
+    # Soporta "no valido - algo"
+    if nv.startswith("no valido"):
+        return True
+    return False
+
+
+def clean_date_str(v):
+    """
+    Devuelve string limpio si es válido; si es vacío/NaN/"No Valido"/token inválido => None.
+    """
+    if is_invalid_token(v):
+        return None
+    return str(v).strip()
+
+
+def ensure_min_columns(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
+    """
+    Asegura al menos A..O (15 columnas). Si faltan, agrega columnas vacías al final.
+    """
+    df = df.copy()
+    missing = MIN_COLS_A_TO_O - df.shape[1]
+    if missing <= 0:
+        return df
+
+    # Nombres sugeridos para columnas extra si faltan:
+    extra_names = ["DIFERENCIA", "Min", "Max", "Diferencia", "Valor priorizado", "RANGO DIFERENCIA"]
+
+    if has_header:
+        start = max(0, len(extra_names) - missing)
+        for name in extra_names[start:]:
+            col_name = name
+            if col_name in df.columns:
+                i = 2
+                while f"{col_name}_{i}" in df.columns:
+                    i += 1
+                col_name = f"{col_name}_{i}"
+            df[col_name] = ""
+    else:
+        for i in range(missing):
+            df[f"__extra_{i+1}__"] = ""
+
+    while df.shape[1] < MIN_COLS_A_TO_O:
+        df[f"__extra_{df.shape[1]+1}__"] = ""
+
+    return df
+
+
+def parse_dates(series: pd.Series, mode: str, dayfirst=None) -> pd.Series:
+    """
+    mode:
+      - "MDY": month/day/year (dayfirst=False)
+      - "DMY": day/month/year (dayfirst=True)
+      - "AUTO": si dayfirst viene definido lo usa, si no decide por cantidad de parseos
+    """
+    if mode == "MDY":
+        return pd.to_datetime(series, errors="coerce", dayfirst=False)
+    if mode == "DMY":
+        return pd.to_datetime(series, errors="coerce", dayfirst=True)
+
+    # AUTO
+    if dayfirst is not None:
+        return pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
+
+    dt_mdy = pd.to_datetime(series, errors="coerce", dayfirst=False)
+    dt_dmy = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    return dt_dmy if dt_dmy.notna().sum() > dt_mdy.notna().sum() else dt_mdy
+
+
+def compute_valor_priorizado(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Columna N (Valor priorizado) BASE (por fila):
+    - Si H tiene valor -> N = H
+    - Si no, si G tiene valor -> N = G
+    - Si no -> "No Valido"
+    """
+    df = df.copy()
+    g = df.iloc[:, IDX_G_ESTIMATED]
+    h = df.iloc[:, IDX_H_ACTUAL]
+
+    out = []
+    for hv, gv in zip(h.tolist(), g.tolist()):
+        h_clean = clean_date_str(hv)
+        g_clean = clean_date_str(gv)
+        if h_clean is not None:
+            out.append(h_clean)
+        elif g_clean is not None:
+            out.append(g_clean)
+        else:
+            out.append("No Valido")
+
+    df.iloc[:, IDX_N_PRIORITIZED] = out
+    return df
+
+
+def fill_n_for_bol_from_containers(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
+    """
+    Para filas BILL_OF_LADING:
+    Si su propia fila NO tiene G NI H, entonces N se toma desde sus contenedores (mismo C):
+      1) Si existe H (ATA) en contenedores => usar H mínima (más antigua)
+      2) Si no, pero existe G (ETA) => usar G mínima (más antigua)
+      3) Si no hay nada => "No Valido"
+    """
+    df = df.copy()
+
+    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
+    mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    if mask_bol.sum() == 0 or mask_container.sum() == 0:
+        return df
+
+    cont_keys = df.loc[mask_container].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    cont_h = df.loc[mask_container].iloc[:, IDX_H_ACTUAL].apply(clean_date_str)
+    cont_g = df.loc[mask_container].iloc[:, IDX_G_ESTIMATED].apply(clean_date_str)
+
+    dayfirst = None
+    if date_mode == "AUTO":
+        combined = pd.concat([cont_h, cont_g], ignore_index=True)
+        dt_mdy = pd.to_datetime(combined, errors="coerce", dayfirst=False)
+        dt_dmy = pd.to_datetime(combined, errors="coerce", dayfirst=True)
+        dayfirst = dt_dmy.notna().sum() > dt_mdy.notna().sum()
+
+    cont_h_dt = parse_dates(cont_h, mode=date_mode, dayfirst=dayfirst)
+    cont_g_dt = parse_dates(cont_g, mode=date_mode, dayfirst=dayfirst)
+
+    sub = pd.DataFrame({"bol": cont_keys, "h": cont_h, "g": cont_g, "h_dt": cont_h_dt, "g_dt": cont_g_dt})
+    sub = sub[sub["bol"] != ""]
+
+    bol_to_n = {}
+    for bol_id, grp in sub.groupby("bol", sort=False):
+        # Preferir H si existe
+        if grp["h"].notna().any():
+            valid_h = grp[grp["h_dt"].notna()]
+            if not valid_h.empty:
+                min_dt = valid_h["h_dt"].min()
+                bol_to_n[bol_id] = valid_h.loc[valid_h["h_dt"] == min_dt, "h"].iloc[0]
+            else:
+                bol_to_n[bol_id] = grp.loc[grp["h"].notna(), "h"].iloc[0]
+            continue
+
+        # Si no hay H, usar G
+        if grp["g"].notna().any():
+            valid_g = grp[grp["g_dt"].notna()]
+            if not valid_g.empty:
+                min_dt = valid_g["g_dt"].min()
+                bol_to_n[bol_id] = valid_g.loc[valid_g["g_dt"] == min_dt, "g"].iloc[0]
+            else:
+                bol_to_n[bol_id] = grp.loc[grp["g"].notna(), "g"].iloc[0]
+            continue
+
+        bol_to_n[bol_id] = "No Valido"
+
+    bol_keys = df.loc[mask_bol].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    bol_g = df.loc[mask_bol].iloc[:, IDX_G_ESTIMATED]
+    bol_h = df.loc[mask_bol].iloc[:, IDX_H_ACTUAL]
+
+    needs_container_n = bol_g.apply(is_blank) & bol_h.apply(is_blank)
+
+    if needs_container_n.any():
+        n_col = df.columns[IDX_N_PRIORITIZED]
+        idx_to_update = df.loc[mask_bol].index[needs_container_n]
+        keys_to_update = bol_keys.loc[needs_container_n]
+        df.loc[idx_to_update, n_col] = keys_to_update.map(bol_to_n).fillna("No Valido").values
+
+    return df
+
+
+def min_max_from_row_g_h(g_val, h_val, date_mode: str) -> tuple[str, str]:
+    """Caso especial (archivo con 1 único C): K/L desde su propia fila usando G/H."""
+    g_str = clean_date_str(g_val)
+    h_str = clean_date_str(h_val)
+
+    if g_str is None and h_str is None:
+        return "No Valido", "No Valido"
+    if g_str is not None and h_str is None:
+        return g_str, g_str
+    if g_str is None and h_str is not None:
+        return h_str, h_str
+
+    dt = parse_dates(pd.Series([g_str, h_str]), mode=date_mode)
+    g_dt, h_dt = dt.iloc[0], dt.iloc[1]
+
+    if pd.isna(g_dt) and pd.isna(h_dt):
+        return "No Valido", "No Valido"
+    if pd.isna(g_dt) and not pd.isna(h_dt):
+        return h_str, h_str
+    if not pd.isna(g_dt) and pd.isna(h_dt):
+        return g_str, g_str
+
+    if g_dt <= h_dt:
+        return g_str, h_str
+    return h_str, g_str
+
+
+def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str):
+    """
+    Calcula bol->min y bol->max usando SOLO CONTENEDORES (mismo C),
+    ignorando N en blanco y N inválido ("No Valido"/tokens).
+    """
+    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    if mask_container.sum() == 0:
+        return {}, {}
+
+    bol = df.loc[mask_container].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    n_raw = df.loc[mask_container].iloc[:, IDX_N_PRIORITIZED]
+
+    n_clean = n_raw.apply(clean_date_str)
+
+    sub = pd.DataFrame({"bol": bol, "n": n_clean})
+    sub = sub[sub["bol"] != ""]
+
+    min_map = {}
+    max_map = {}
+
+    for bol_id, grp in sub.groupby("bol", sort=False):
+        vals = grp["n"].dropna()
+        if vals.empty:
+            min_map[bol_id] = "No Valido"
+            max_map[bol_id] = "No Valido"
+            continue
+
+        if date_mode == "AUTO":
+            dt_mdy = pd.to_datetime(vals, errors="coerce", dayfirst=False)
+            dt_dmy = pd.to_datetime(vals, errors="coerce", dayfirst=True)
+            dt = dt_dmy if dt_dmy.notna().sum() > dt_mdy.notna().sum() else dt_mdy
+        elif date_mode == "MDY":
+            dt = pd.to_datetime(vals, errors="coerce", dayfirst=False)
+        else:  # DMY
+            dt = pd.to_datetime(vals, errors="coerce", dayfirst=True)
+
+        valid = pd.DataFrame({"n": vals, "dt": dt})
+        valid = valid[valid["dt"].notna()]
+
+        if valid.empty:
+            min_map[bol_id] = "No Valido"
+            max_map[bol_id] = "No Valido"
+            continue
+
+        min_dt = valid["dt"].min()
+        max_dt = valid["dt"].max()
+
+        min_map[bol_id] = valid.loc[valid["dt"] == min_dt, "n"].iloc[0]
+        max_map[bol_id] = valid.loc[valid["dt"] == max_dt, "n"].iloc[0]
+
+    return min_map, max_map
+
+
+def fill_k_l_for_container_rows(df: pd.DataFrame, min_map: dict, max_map: dict) -> pd.DataFrame:
+    """Rellena K/L SOLO en filas contenedor usando col C como llave."""
+    df = df.copy()
+    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    if mask_container.sum() == 0:
+        return df
+
+    bol_keys = df.loc[mask_container].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+
+    colK = df.columns[IDX_K_MIN]
+    colL = df.columns[IDX_L_MAX]
+
+    df.loc[mask_container, colK] = bol_keys.map(min_map).fillna("No Valido")
+    df.loc[mask_container, colL] = bol_keys.map(max_map).fillna("No Valido")
+    return df
+
+
+def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_map: dict, date_mode: str) -> pd.DataFrame:
+    """
+    K/L para filas BILL_OF_LADING:
+
+    - Si el archivo tiene SOLO 1 valor único (no vacío) en C:
+        K/L desde su propia fila usando MIN/MAX entre G y H.
+        Si G/H no válidos, fallback a contenedores.
+    - Si el archivo tiene MÁS de 1 valor en C:
+        K/L SIEMPRE desde contenedores (min_map/max_map).
+    """
+    df = df.copy()
+    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    if mask_bol.sum() == 0:
+        return df
+
+    colK = df.columns[IDX_K_MIN]
+    colL = df.columns[IDX_L_MAX]
+
+    all_keys = df.iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    unique_nonblank_c = pd.unique(all_keys[all_keys != ""])
+    only_one_unique_in_file = len(unique_nonblank_c) == 1
+
+    if only_one_unique_in_file:
+        bol_indexes = df.loc[mask_bol].index.tolist()
+        k_values = []
+        l_values = []
+
+        for idx in bol_indexes:
+            g_val = df.at[idx, df.columns[IDX_G_ESTIMATED]]
+            h_val = df.at[idx, df.columns[IDX_H_ACTUAL]]
+            mn, mx = min_max_from_row_g_h(g_val, h_val, date_mode=date_mode)
+
+            if mn == "No Valido" and mx == "No Valido":
+                key = clean_bol_key(df.at[idx, df.columns[IDX_C_BOL]])
+                mn = min_map.get(key, "No Valido")
+                mx = max_map.get(key, "No Valido")
+
+            k_values.append(mn)
+            l_values.append(mx)
+
+        df.loc[mask_bol, colK] = pd.Series(k_values, index=bol_indexes).fillna("No Valido")
+        df.loc[mask_bol, colL] = pd.Series(l_values, index=bol_indexes).fillna("No Valido")
+        return df
+
+    bol_keys = all_keys[mask_bol]
+    df.loc[mask_bol, colK] = bol_keys.map(min_map).fillna("No Valido")
+    df.loc[mask_bol, colL] = bol_keys.map(max_map).fillna("No Valido")
+    return df
+
+
+def fill_hours_diff_in_j(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
+    """
+    Columna J (DIFERENCIA):
+    - Diferencia en horas entre L y K: (L - K) en horas
+    - Si K/L no es fecha válida o es "No Valido" => J = "No Valido"
+    """
+    df = df.copy()
+
+    k_raw = df.iloc[:, IDX_K_MIN]
+    l_raw = df.iloc[:, IDX_L_MAX]
+
+    k_clean = k_raw.apply(clean_date_str)
+    l_clean = l_raw.apply(clean_date_str)
+
+    dayfirst = None
+    if date_mode == "AUTO":
+        combined = pd.concat([k_clean, l_clean], ignore_index=True)
+        dt_mdy = pd.to_datetime(combined, errors="coerce", dayfirst=False)
+        dt_dmy = pd.to_datetime(combined, errors="coerce", dayfirst=True)
+        dayfirst = dt_dmy.notna().sum() > dt_mdy.notna().sum()
+
+    k_dt = parse_dates(k_clean, mode=date_mode, dayfirst=dayfirst)
+    l_dt = parse_dates(l_clean, mode=date_mode, dayfirst=dayfirst)
+
+    diff_hours = (l_dt - k_dt) / pd.Timedelta(hours=1)
+
+    def fmt_hours(x):
+        if pd.isna(x):
+            return "No Valido"
+        if abs(float(x) - round(float(x))) < 1e-9:
+            return str(int(round(float(x))))
+        return f"{float(x):.2f}"
+
+    df.iloc[:, IDX_J_DIFF_HOURS] = diff_hours.apply(fmt_hours)
+    return df
+
+
+def fill_range_in_o(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Columna O (RANGO DIFERENCIA) usando J (DIFERENCIA en horas):
+      - J == 0            => "0"
+      - 0 < J <= 24       => "0 - 24 Hrs"
+      - J > 24            => "+ de 24 Hrs"
+      - inválido/No Valido => "No Valido"
+    """
+    df = df.copy()
+    j_raw = df.iloc[:, IDX_J_DIFF_HOURS]
+
+    def parse_hours(v):
+        if is_invalid_token(v):
+            return None
+        s = str(v).strip().replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    def bucket(v):
+        h = parse_hours(v)
+        if h is None or h < 0:
+            return "No Valido"
+        if abs(h) < 1e-9:
+            return "0"
+        if h <= 24:
+            return "0 - 24 Hrs"
+        return "+ de 24 Hrs"
+
+    df.iloc[:, IDX_O_RANGE] = j_raw.apply(bucket)
+    return df
+
+
+# =======================
+# NUEVO REPORTE: BoL con contenedores mixtos ATA
+# =======================
+def get_mixed_ata_bols_and_rows(df: pd.DataFrame) -> tuple[set, pd.DataFrame]:
+    """
+    Identifica BOLs (col C) donde, entre sus CONTENEDORES:
+      - existe al menos 1 contenedor con ATA (H válido)
+      - y existe al menos 1 contenedor sin ATA (H vacío/No Valido)
+
+    Devuelve:
+      - set de bol_ids con mezcla
+      - DataFrame con SOLO filas contenedor de esos bol_ids
+    """
+    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    if mask_container.sum() == 0:
+        return set(), df.iloc[0:0].copy()
+
+    cont = df.loc[mask_container].copy()
+    cont["_bol"] = cont.iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    cont = cont[cont["_bol"] != ""]  # sin bol_id no se puede agrupar
+
+    if cont.empty:
+        return set(), df.iloc[0:0].copy()
+
+    cont["_ata_present"] = cont.iloc[:, IDX_H_ACTUAL].apply(lambda v: clean_date_str(v) is not None)
+
+    grp = cont.groupby("_bol")["_ata_present"].agg(any_has_ata="any", all_have_ata="all")
+    mixed_bols = grp[(grp["any_has_ata"]) & (~grp["all_have_ata"])].index.tolist()
+
+    out_rows = cont[cont["_bol"].isin(mixed_bols)].drop(columns=["_bol", "_ata_present"])
+    return set(mixed_bols), out_rows
+
+
+def build_summary_counts(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tabla Resumen (solo filas BILL_OF_LADING, contadas por BL único = col A):
+    - BL únicos
+    - BL válidos (N != No Valido)
+    - BLs con diferencia 0
+    - BLs con diferencia 0 - 24 Hrs
+    - BLs con diferencia + de 24 Hrs
+
+    + NUEVO:
+    - BoL con contenedores mixtos ATA (con y sin)
+    - Contenedores en BoL mixtos ATA
+    """
+    types_norm = df_out.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    mixed_bols, mixed_rows = get_mixed_ata_bols_and_rows(df_out)
+
+    if mask_bol.sum() == 0:
+        return pd.DataFrame([
+            {"indicador": "BL únicos", "valor": 0},
+            {"indicador": "BL válidos", "valor": 0},
+            {"indicador": "BLs con diferencia 0", "valor": 0},
+            {"indicador": "BLs con diferencia 0 - 24 Hrs", "valor": 0},
+            {"indicador": "BLs con diferencia + de 24 Hrs", "valor": 0},
+            {"indicador": "BoL con contenedores mixtos ATA (con y sin)", "valor": int(len(mixed_bols))},
+            {"indicador": "Contenedores en BoL mixtos ATA", "valor": int(len(mixed_rows))},
+        ])
+
+    bol_df = df_out.loc[mask_bol].copy()
+
+    bol_df["_bl_id"] = bol_df.iloc[:, IDX_A_SHIPMENT_ID].apply(lambda v: None if is_blank(v) else str(v).strip())
+    bol_df = bol_df[bol_df["_bl_id"].notna()]
+    bol_df = bol_df.drop_duplicates(subset=["_bl_id"], keep="first")
+
+    bl_unicos = int(bol_df["_bl_id"].nunique())
+
+    n_norm = bol_df.iloc[:, IDX_N_PRIORITIZED].apply(normalize_text_for_compare)
+    bl_validos = int(((n_norm != "") & ~(n_norm == "no valido") & ~n_norm.str.startswith("no valido")).sum())
+
+    o_val = bol_df.iloc[:, IDX_O_RANGE].apply(lambda v: "" if is_blank(v) else str(v).strip())
+    diff_0 = int((o_val == "0").sum())
+    diff_0_24 = int((o_val == "0 - 24 Hrs").sum())
+    diff_gt_24 = int((o_val == "+ de 24 Hrs").sum())
+
+    return pd.DataFrame([
+        {"indicador": "BL únicos", "valor": bl_unicos},
+        {"indicador": "BL válidos", "valor": bl_validos},
+        {"indicador": "BLs con diferencia 0", "valor": diff_0},
+        {"indicador": "BLs con diferencia 0 - 24 Hrs", "valor": diff_0_24},
+        {"indicador": "BLs con diferencia + de 24 Hrs", "valor": diff_gt_24},
+        {"indicador": "BoL con contenedores mixtos ATA (con y sin)", "valor": int(len(mixed_bols))},
+        {"indicador": "Contenedores en BoL mixtos ATA", "valor": int(len(mixed_rows))},
+    ])
+
+
+def to_csv_bytes(df: pd.DataFrame, sep: str, include_header: bool) -> bytes:
+    return df.to_csv(index=False, sep=sep, header=include_header).encode("utf-8-sig")
+
+
+# =======================
+# ---------------- Streamlit UI ----------------
+# =======================
+st.set_page_config(page_title="Reporte CSV", layout="wide")
+st.title("Reporte CSV: Tabla Resumen + Archivo completo + Mixtos ATA")
+
+uploaded = st.file_uploader("Sube tu archivo CSV", type=["csv"])
+has_header = st.checkbox("Mi archivo tiene encabezados (header)", value=True)
+
+if uploaded:
+    raw_text = uploaded.getvalue().decode("utf-8-sig", errors="replace")
+    detected = sniff_delimiter(raw_text)
+    sep = st.selectbox("Delimitador", options=[detected, ",", ";", "\t", "|"], index=0)
+
+    date_mode = st.selectbox(
+        "Formato de fecha para cálculos (N/K/L)",
+        options=["AUTO", "MDY", "DMY"],
+        index=0,
+    )
+
+    try:
+        if has_header:
+            df = pd.read_csv(StringIO(raw_text), sep=sep, dtype=str, keep_default_na=True)
+        else:
+            df = pd.read_csv(StringIO(raw_text), sep=sep, header=None, dtype=str, keep_default_na=True)
+
+        df = ensure_min_columns(df, has_header)
+
+        if df.shape[1] < MIN_COLS_A_TO_O:
+            st.error("El archivo no tiene suficientes columnas para llegar hasta la columna O (A..O).")
+            st.stop()
+
+        if st.button("Procesar"):
+            # 1) N base
+            df_out = compute_valor_priorizado(df)
+
+            # 2) N para BOL se completa desde contenedores si su G/H están vacíos
+            df_out = fill_n_for_bol_from_containers(df_out, date_mode=date_mode)
+
+            # 3) Min/Max desde contenedores ignorando inválidos
+            min_map, max_map = compute_min_max_maps_from_containers(df_out, date_mode=date_mode)
+
+            df_out = fill_k_l_for_container_rows(df_out, min_map=min_map, max_map=max_map)
+            df_out = fill_k_l_for_bol_rows_from_containers(df_out, min_map=min_map, max_map=max_map, date_mode=date_mode)
+
+            # 4) Diferencia horas (J) + rango (O)
+            df_out = fill_hours_diff_in_j(df_out, date_mode=date_mode)
+            df_out = fill_range_in_o(df_out)
+
+            # 5) Resumen (incluye métricas nuevas)
+            resumen = build_summary_counts(df_out)
+
+            # 6) Nuevo reporte: contenedores con BoL mixto ATA
+            mixed_bols, mixed_ata_rows = get_mixed_ata_bols_and_rows(df_out)
+
+            st.success("Listo.")
+
+            st.subheader("Tabla Resumen")
+            st.dataframe(resumen, use_container_width=True)
+
+            st.download_button(
+                "Descargar Tabla Resumen.csv",
+                data=to_csv_bytes(resumen, sep=",", include_header=True),
+                file_name="Tabla Resumen.csv",
+                mime="text/csv",
+            )
+
+            st.download_button(
+                "Descargar Archivo completo.csv",
+                data=to_csv_bytes(df_out, sep=sep, include_header=has_header),
+                file_name="Archivo completo.csv",
+                mime="text/csv",
+            )
+
+            st.subheader("Nuevo reporte: BoL con contenedores mixtos ATA")
+            st.write(f"BoL afectados: {len(mixed_bols)} | Contenedores en esos BoL: {len(mixed_ata_rows)}")
+
+            st.download_button(
+                "Descargar Contenedores_BoL_mixtos_ATA.csv",
+                data=to_csv_bytes(mixed_ata_rows, sep=sep, include_header=has_header),
+                file_name="Contenedores_BoL_mixtos_ATA.csv",
+                mime="text/csv",
+            )
+
+            with st.expander("Vista previa (primeras 20 filas) - Archivo completo"):
+                st.dataframe(df_out.head(20), use_container_width=True)
+
+            with st.expander("Vista previa (primeras 20 filas) - Mixtos ATA"):
+                st.dataframe(mixed_ata_rows.head(20), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Error leyendo o procesando el CSV: {e}")
